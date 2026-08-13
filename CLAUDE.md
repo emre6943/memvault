@@ -13,8 +13,11 @@ weekly curation pass.
 and every path, route, and rule comes from `memvault.config.yaml`. Never hardcode a personal path
 in `src/` — that is the property that makes this usable by anyone else.
 
-Status: **implemented.** All ten plan units are built and verified end to end against a real
-vault. 629 tests; `ruff` and `mypy --strict` clean.
+Status: **v2 shipped (2026-08-13).** Graph-in-Markdown, blended ranking (importance/recency/
+graph over RRF), reflection write-back notes, idle-triggered debounced ingest, classifier
+presets, `memvault init`, and a `memvault mcp` stdio server. 1196 tests; `ruff` and
+`mypy --strict` clean. Public repo: `emre6943/memvault` (single-commit); full history lives in
+the private `emre6943/memvault-archive`.
 
 - Requirements: `docs/brainstorms/2026-08-01-memvault-requirements.md`
 - Plan: `docs/plans/2026-08-01-001-feat-memvault-engine-plan.md`
