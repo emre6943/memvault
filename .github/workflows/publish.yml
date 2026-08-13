@@ -1,0 +1,124 @@
+# Publish `memvault` to PyPI (R12).
+#
+# Tag-triggered, and split into two jobs on purpose. `build` has no credentials of any kind and
+# does everything that can fail for ordinary reasons — building, checking the tag against the
+# version, installing the wheel the way a stranger would and running it. `publish` does one
+# thing, and it is the only job that holds `id-token: write`, so nothing that merely inspects an
+# artifact can ever mint a token with it.
+#
+# Trusted publishing (OIDC) means there is no API token anywhere: PyPI is configured to accept
+# this repository, this workflow filename, and this environment. That configuration lives on
+# PyPI, not here — a fork of this repo publishes nothing.
+#
+# One-time setup this file assumes:
+#   1. PyPI → the `memvault` project → Publishing → add a GitHub publisher for
+#      `emre6943/memvault`, workflow `publish.yml`, environment `pypi`.
+#   2. The same on test.pypi.org with environment `testpypi`, for the dry run.
+#   3. Repository → Settings → Environments → create `pypi` and `testpypi`.
+#
+# Dry run before the first real publish: run this workflow manually with target `testpypi`.
+
+name: publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Where to publish"
+        required: true
+        default: testpypi
+        type: choice
+        options:
+          - testpypi
+          - pypi
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Check the tag against the version in the package
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tagged="${GITHUB_REF_NAME#v}"
+          declared="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/memvault/__init__.py)"
+          echo "tag=$tagged declared=$declared"
+          # A tag that disagrees with the module is a release nobody can trace back to a commit.
+          test "$tagged" = "$declared"
+
+      - name: Build the sdist and the wheel
+        run: uv build
+
+      - name: Smoke-test the wheel the way a stranger installs it
+        run: |
+          set -euo pipefail
+          wheel="$(ls dist/*.whl)"
+          # `--isolated --no-project` is the point: nothing from this checkout, no lockfile, no
+          # dev group — only what the wheel itself declares it needs.
+          uv run --isolated --no-project --with "$wheel" memvault --help
+          # R12's "the bare install is light": `fastembed` is an extra, so it must NOT arrive
+          # with the default install. This assertion is the only thing standing between that
+          # promise and a stray core dependency.
+          uv run --isolated --no-project --with "$wheel" python -c \
+            "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('fastembed') is None else 1)"
+          # And the front door works end to end on a machine that has never seen a vault:
+          # scaffold one, index it, search it, and let `doctor` judge the result. `--config`
+          # keeps all of it inside the runner's temp directory rather than in a user config
+          # location. Note what this proves about R12 — the index and the search below run on
+          # the bare install, with no model and no network, which is the whole promise.
+          run() { uv run --isolated --no-project --with "$wheel" \
+            memvault --config "$RUNNER_TEMP/config.yaml" "$@"; }
+          run init "$RUNNER_TEMP/vault" --name smoke --git
+          run index | tee "$RUNNER_TEMP/index.out"
+          grep -q 'semantic search is off' "$RUNNER_TEMP/index.out"
+          run recall vault | tee "$RUNNER_TEMP/recall.out"
+          grep -q 'semantic search is off' "$RUNNER_TEMP/recall.out"
+          # `doctor` runs last and must exit 0: before the index exists it correctly reports a
+          # missing one, so a green doctor here means the whole sequence landed.
+          run doctor
+          # The extra must resolve too, or `[semantic]` is a promise nobody has ever checked.
+          uv run --isolated --no-project --with "${wheel}[semantic]" python -c \
+            "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('fastembed') else 1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.target || 'pypi' }}
+    permissions:
+      # The whole reason the jobs are split. Only this one can mint an OIDC token.
+      id-token: write
+    steps:
+      - uses: astral-sh/setup-uv@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish
+        env:
+          TARGET: ${{ github.event.inputs.target || 'pypi' }}
+        run: |
+          set -euo pipefail
+          if [ "$TARGET" = "testpypi" ]; then
+            uv publish --trusted-publishing always --publish-url https://test.pypi.org/legacy/
+          else
+            uv publish --trusted-publishing always
+          fi

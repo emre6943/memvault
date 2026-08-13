@@ -1,0 +1,232 @@
+# MemVault configuration — the annotated reference.
+#
+# `memvault init` writes a minimal version of this file for you; this one exists to show every
+# key with the reasoning behind its default. Copy it to `~/.config/memvault/config.yaml` (or to
+# `memvault.config.yaml` beside your work) and edit, or read it alongside the generated file.
+#
+# The engine holds no vault paths of its own. Everything it needs to act on a vault is here,
+# which is what lets one install drive several vaults.
+#
+# The two vaults below are the personal/work split the engine is shaped around: raw material
+# lands in the personal vault and only distilled notes ever cross. A single-vault setup is the
+# common case — delete the second vault and the `work_route` line.
+
+default_vault: personal
+
+vaults:
+  personal:
+    # A vault must be a git repository — its commit history is the audit log.
+    root: ~/vault
+    inbox: inbox
+
+    # Where filed material lands. Placeholders: {yyyy} {mm} {dd} {date} {slug} {ww}
+    transcript_template: "transcripts/{yyyy}/{mm}/{date}-{slug}.md"
+    digest_template: "digest/{yyyy}-W{ww}.md"
+
+    # Where per-project durable memory lives, one directory per project. The weekly pass
+    # appends into learnings.md / quirks.md / reflect-log.md under it, and creates the
+    # directory from a skeleton the first time a project produces an entry. Must contain
+    # {project}.
+    memory_template: "repos/{project}"
+
+    # Where the weekly pass writes its reflection note: the questions it posed itself about
+    # the window, answered with citations into the files it read. Indexed and recallable like
+    # any other note, and never read back as material for a later pass.
+    reflection_template: "reflections/{yyyy}/{date}-reflection.md"
+
+    # Items marked `local_only: true` are filed under this prefix, which the vault's own
+    # .gitignore excludes. Enforcement is the ignore rule, not pipeline discipline.
+    local_only_prefix: private
+
+    # Work-classified material is distilled into this vault. Raw transcripts never cross.
+    work_route: work
+
+    # Whether the weekly pass reads claude-mem observations for this vault at all. claude-mem is
+    # a Claude Code plugin, not part of this engine: set it to false (or leave the project map
+    # below empty) if you do not run it, and reflection uses vault material alone with no
+    # degraded-source warning. Defaults to true.
+    claude_mem: true
+
+    # claude-mem stores work and personal observations in one database, so reflection reads
+    # only the projects listed here. An unlisted project is skipped, never defaulted in — this
+    # is a boundary control rather than a filter. Keys are the canonical names you want in your
+    # memory files; values are the raw project keys claude-mem may use for the same thing.
+    claude_mem_projects:
+      my-app: [my-app]
+      side-project: [side-project, SideProject]
+
+  work:
+    root: ~/work-vault
+    inbox: inbox
+    note_template: "notes/{yyyy}/{date}-{slug}.md"
+    claude_mem_projects:
+      internal-api: [internal-api, internal-api-workspace-1]
+      dashboard: [dashboard, dashboard-workspace]
+
+classifier:
+  # Executable name or absolute path. A shell function that shadows `claude` does not affect
+  # this — subprocess execution bypasses shell aliases — but an absolute path works too.
+  command: claude
+
+  # Which CLI that command actually is: claude | codex | opencode | custom. This decides the
+  # arguments it is called with and how its reply is unwrapped, which is a different question
+  # from what the binary is named. `custom` runs `command` exactly as written and expects bare
+  # JSON back — the behaviour that existed before presets, and the escape hatch for a CLI with
+  # no entry here.
+  #
+  #   claude    <command> -p --output-format json [--model M]
+  #   codex     <command> exec --json --skip-git-repo-check [--model M] -
+  #   opencode  <command> run [--model M]
+  #   custom    <command>
+  #
+  # The prompt always arrives on stdin, because a transcript is longer than any argument limit.
+  # A CLI that cannot read its prompt from stdin needs a wrapper script and `custom`.
+  preset: claude
+
+  model: null
+  # Below this confidence the item stays in the inbox for review rather than being filed.
+  confidence_threshold: 0.7
+  timeout_seconds: 120
+
+distill:
+  # The verbatim-leakage guard that stands between the personal vault and the work vault.
+  # Before a distilled note is written, every sentence of the raw drop is scored for how much
+  # of itself survives into the note; a sentence above this fraction fails the write and holds
+  # the item for review. Lower is stricter — 0.0 blocks on any matching run at all.
+  overlap_threshold: 0.4
+
+  # How many consecutive words count as a match. This is also the guard's one deliberate hole:
+  # a sentence shorter than this can never trip it, which is what lets a short common phrase
+  # like "we should ship it" through. Raising it widens that hole.
+  shingle_size: 6
+
+index:
+  # Lives outside the vault's git tree; disposable and rebuildable from files at any time.
+  path: ~/.memvault/{vault}.db
+  backend: fastembed
+  model: intfloat/multilingual-e5-small
+  chunk_max_chars: 1200
+  chunk_overlap_chars: 150
+  include: ["**/*.md"]
+  exclude: [".git/**", "node_modules/**", "index/**"]
+
+  # Absolute cosine floor for semantic hits — MODEL-SPECIFIC, change it when you change `model`.
+  # E5 packs everything into a narrow band, so filtering only against the corpus median would
+  # return half the vault for any query. Measured on a real 1087-chunk vault: genuine queries
+  # peak at 0.84-0.90, nonsense queries at 0.81-0.82. Raise toward 0.84 for stricter recall,
+  # lower toward 0.78 to surface weak matches.
+  min_similarity: 0.82
+
+# How recall combines its signals into one score.
+#
+# `keyword` and `semantic` scale the two candidate pools, whose contributions are reciprocal-rank
+# shaped: each hit adds 1/(60 + rank), so the top of a list is worth ~0.0164 and the tenth entry
+# ~0.0143. 1.0 leaves both exactly as they have always behaved.
+#
+# `importance`, `recency`, and `graph` are additive terms on that same scale, each normalised to
+# 0-1 before its weight applies — which is why they look small. The whole importance swing, a 1
+# against a 10, is 0.01 next to the 0.0164 a first place is worth: enough to reorder near-ties,
+# not enough to overturn a decisive match. Raw cosine similarity is deliberately never blended by
+# magnitude; see index.min_similarity for why.
+#
+# The calibrated part is the ratio, not the sizes: importance is twice recency because a file
+# being old is no evidence it is wrong, while an importance score is a judgement someone made.
+#
+# These numbers are calibrated against a model and a corpus, not derived. Setting importance,
+# recency, and graph to 0 reproduces pre-v2 ordering exactly — the right place to sit until your
+# vault's files actually carry `importance:` values.
+ranking:
+  keyword: 1.0
+  semantic: 1.0
+  importance: 0.01
+  recency: 0.005
+  graph: 0.005
+
+  # A file this many days old scores half the recency term of one written today. Shorten it for
+  # a vault that is mostly operational churn. Must be positive — switch recency off with its
+  # weight, not with a zero half-life.
+  half_life_days: 180
+
+# Idle-triggered ingestion: when the debounced pass is allowed to run.
+#
+# A SessionEnd hook runs `memvault ingest --enqueue`, which touches a queue marker and leaves a
+# runner waiting; a SessionStart hook runs `memvault ingest --session-start <id>`, which marks
+# the session active so the runner does not file material out from under a session still writing
+# it. The queue marker is the source of truth — a closed lid kills the runner, and the next
+# session (or a plain `memvault ingest` from a scheduled job) services the request it left.
+#
+# Markers live in $XDG_STATE_HOME/memvault/<vault>/ (override with $MEMVAULT_STATE_DIR), never
+# inside the vault, where they would be uncommitted state under the tree the guard inspects.
+debounce:
+  # How long the queue marker must sit un-refreshed before the pass runs. A working default,
+  # not a measured one: too short files a session's material while it is still being written,
+  # too long recreates the fixed-clock delay this replaces. Set 0 to run at the first check.
+  quiet_minutes: 15
+
+  # How often the waiting runner looks again. It sleeps in these increments, so this is also
+  # how long a run can lag behind the moment it became due.
+  poll_seconds: 30
+
+  # An active-session marker older than this is treated as a crashed session and deleted. Without
+  # it, one killed terminal would suspend ingestion permanently — the failure the marker pair was
+  # introduced to avoid.
+  session_max_age_minutes: 720
+
+  # Under idle-triggering the pass fires whenever work goes quiet, which is exactly when you are
+  # most likely to have uncommitted vault edits open — so a dirty-guard refusal is an ordinary
+  # event, not an error. Each one reschedules with a doubling wait, capped, and stays silent.
+  retry_minutes: 5
+  max_retry_minutes: 60
+
+  # How many refusals in a row before one notification. A streak means something is genuinely
+  # stuck rather than somebody mid-edit.
+  notify_after_refusals: 3
+
+# Splitting one drop into topical segments before classifying it.
+#
+# Off by default: a deliberately written note is about one thing, and splitting it would spend a
+# model call to learn that. Turn it on when a vault takes ambient capture — a recorded
+# conversation genuinely covers several subjects, and classifying the whole thing as one gets
+# every available answer wrong. With this on, each segment is classified and routed on its own,
+# so the work part of a conversation can earn a distilled work note while the personal part
+# never leaves the personal vault.
+#
+# Raw content still reaches only the personal vault, and the work vault still receives distilled
+# notes only. Segmentation changes how many bodies there are, never where they may go.
+segment:
+  enabled: false
+
+  # Below this many characters, file the drop whole without asking a model. Short drops are
+  # rarely multi-topic and always cheap to get wrong.
+  min_chars: 2000
+
+  # A hard ceiling on the fan-out. Every segment costs one classification, and a segmenter that
+  # returned forty fragments of a rambling conversation would be expensive and useless.
+  # Exceeding it holds the drop rather than truncating, because dropping segments would lose
+  # material silently.
+  max_segments: 12
+
+  timeout_seconds: 180
+
+# Per-source overrides, keyed by a drop's declared `source` frontmatter value.
+#
+# A note you pasted on purpose and a 90-minute conversation your glasses recorded without being
+# asked deserve different caution. Every field defaults to inheriting the global setting, so a
+# source with no entry here behaves exactly as it did before this section existed.
+#
+# Both dials narrow only. `work_route: never` can suppress a distilled note the routing table
+# would have created, but nothing here can create one it would not; a `confidence_threshold` can
+# demand more certainty than the global setting, never less. Policy may tighten the work
+# boundary and may not loosen it.
+sources:
+  conversate:
+    # Ambient conversation is exactly the multi-topic case segmentation exists for.
+    segment: true
+
+    # Recommended while you are still judging whether the segment boundaries are any good:
+    # everything files personal-only and nothing crosses into the work vault. Read a week of
+    # real diffs, then remove this line.
+    work_route: never
+
+    # An unprompted recording is weaker evidence than something you chose to write down.
+    confidence_threshold: 0.85
