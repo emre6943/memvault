@@ -67,7 +67,7 @@ from opening the two or three files that look right, not from the snippets.
   lets a query about nothing return nothing. With an E5 backend, whose unrelated text
   still scores around 0.75, add `--min-similarity` to make that cut bite.
 - The semantic half is optional: embeddings ship in the `semantic` extra
-  (`uv tool install "memvault[semantic]"`). Without it, or against an index built
+  (`uv tool install "memvault-cli[semantic]"`). Without it, or against an index built
   without it, recall still runs the keyword half in full and adds one line saying so.
   That line is load-bearing — half a search returns "nothing matches" exactly as
   confidently as a whole one.

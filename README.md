@@ -34,8 +34,8 @@ several vaults (for example, a personal one and a work one) with no code changes
 ## Install
 
 ```bash
-uv tool install "memvault[semantic]"    # recommended
-uv tool install memvault                # light: keyword search only
+uv tool install "memvault-cli[semantic]"    # recommended
+uv tool install memvault-cli                # light: keyword search only
 ```
 
 The `semantic` extra pulls `fastembed` and downloads a ~130MB multilingual model on first index.

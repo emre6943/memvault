@@ -70,7 +70,7 @@ NULL_MODEL_ID = "null"
 #: `fastembed` is an extra — belongs to the module that owns the backend.
 SEMANTIC_EXTRA_HINT = (
     "semantic search is off: this install has no `fastembed`. Add it with "
-    '`uv tool install "memvault[semantic]"` (or `uv sync --extra semantic`) and re-run '
+    '`uv tool install "memvault-cli[semantic]"` (or `uv sync --extra semantic`) and re-run '
     "`memvault index`. Keyword search works without it."
 )
 

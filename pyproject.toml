@@ -1,5 +1,5 @@
 [project]
-name = "memvault"
+name = "memvault-cli"
 dynamic = ["version"]
 description = "File-first memory engine: inbox ingestion, hybrid retrieval, weekly reflection"
 readme = "README.md"
