@@ -131,7 +131,16 @@ Three properties a feeder can rely on:
   a better model — and the next successful pass removes both files together.
 
 A drop that is still in the inbox with no marker beside it was not reached: either the pass has
-not run, or it refused to start (see below).
+not run, it refused to start (see below), or discovery skipped the file (wrong extension, not
+UTF-8, empty once frontmatter is removed).
+
+**Anything left unheld in the inbox for more than 48 hours makes the pass non-OK, once.** After
+every pass, each non-hidden file still in the inbox with no `.needs-review` marker beside it and
+a modification time older than 48 hours is reported as `STALE`. The first pass on a machine to
+find it exits `3`; later passes still list it but no longer change the exit status, until the
+file is rewritten (a new mtime) or leaves. Held drops are reported as held instead. Age comes from
+the file, not from its name or its `date:` — a feeder may name a drop for when the conversation
+started and write it days later.
 
 ## When the pass refuses to start
 
@@ -140,8 +149,8 @@ the inbox, because its own commit is the review surface and must not carry someo
 Uncommitted changes *inside* the inbox are fine — a hand-pasted `note.txt` is the documented
 minimum drop, and the pass stages only the exact inbox paths it touched.
 
-Exit statuses: `0` everything filed, `3` some items were held for review, `1` the pass could not
-run or its commit failed.
+Exit statuses: `0` everything filed, `3` some items were held for review or an inbox file
+first went stale, `1` the pass could not run or its commit failed.
 
 ## Worked example
 

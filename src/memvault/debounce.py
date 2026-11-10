@@ -79,6 +79,7 @@ QUEUE_MARKER = "ingest.queued"
 RUNNER_LOCK = "runner.lock"
 SESSIONS_DIR = "sessions"
 RETRY_STATE = "retry.json"
+STALE_STATE = "stale-reported"
 
 #: Directories a spawned runner is given on `PATH` on top of whatever it inherited. The engine
 #: itself needs none of them — it is started by absolute interpreter path — but the classifier is
@@ -147,6 +148,10 @@ class StatePaths:
     @property
     def retry(self) -> Path:
         return self.root / RETRY_STATE
+
+    @property
+    def stale(self) -> Path:
+        return self.root / STALE_STATE
 
     def session(self, session_id: str) -> Path:
         """The marker for one session. The id is folded to a safe filename, never a path.
@@ -668,7 +673,9 @@ def _default_ingest(config: Config, vault: VaultConfig) -> IngestReport:
     dirty-guard refusal — which is explicitly not a failure. The runner takes the notification
     decision instead, so a refusal is silent until it has repeated.
     """
-    return run_ingest(config, vault, notifier=None)
+    return run_ingest(
+        config, vault, notifier=None, stale_state=StatePaths.for_vault(vault.name).stale
+    )
 
 
 def run_runner(
