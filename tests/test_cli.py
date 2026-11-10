@@ -18,7 +18,7 @@ from memvault import cli
 from memvault.cli import main
 from memvault.config import IndexConfig
 from memvault.index import NULL_MODEL_ID, SEMANTIC_EXTRA_HINT, IndexBuildError, IndexStats
-from memvault.ingest import EXIT_FAILED, EXIT_PARTIAL, HeldItem, IngestReport
+from memvault.ingest import EXIT_FAILED, EXIT_PARTIAL, HeldItem, IngestReport, StaleItem
 from memvault.reflect import AppendedEntry, ReflectReport
 from tests.test_config import make_vault, write_config
 
@@ -376,6 +376,39 @@ class TestIngestCommand:
         assert code == EXIT_PARTIAL
         assert "REVIEW   murky.md — confidence 0.30 is too low" in captured.out
         assert ".needs-review" in captured.err
+
+    def test_a_stale_inbox_file_exits_partial_and_is_named(
+        self,
+        healthy_config: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        report = IngestReport(vault="personal", stale=(StaleItem("whiteboard.jpg", 50),))
+        self._stub_pass(monkeypatch, report)
+
+        code = main(["--config", str(healthy_config), "ingest"])
+        captured = capsys.readouterr()
+
+        assert code == EXIT_PARTIAL
+        assert "STALE    whiteboard.jpg — in the inbox 50h and not filed;" in captured.out
+        assert "1 stale in the inbox" in captured.out
+        assert "older than 48h" in captured.err
+
+    def test_a_stale_file_reported_before_is_listed_but_exits_ok(
+        self,
+        healthy_config: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        stale = StaleItem("whiteboard.jpg", 74, reported_before=True)
+        self._stub_pass(monkeypatch, IngestReport(vault="personal", stale=(stale,)))
+
+        code = main(["--config", str(healthy_config), "ingest"])
+        captured = capsys.readouterr()
+
+        assert code == 0
+        assert "not filed (reported before)" in captured.out
+        assert "older than 48h" not in captured.err
 
     def test_a_failure_exits_one_and_names_itself(
         self,

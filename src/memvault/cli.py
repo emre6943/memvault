@@ -46,6 +46,7 @@ from memvault.index import (
 )
 from memvault.ingest import (
     DEFAULT_LOG_PATH,
+    STALE_AFTER,
     IngestReport,
     IngestStatus,
     run_ingest,
@@ -254,6 +255,15 @@ def _print_ingest(report: IngestReport) -> None:
         print(_status("blocked", f"{blocked.filename} — {blocked.reason}"))
     for held in report.held:
         print(_status("review", f"{held.filename} — {held.reason}"))
+    for stale in report.stale:
+        again = " (reported before)" if stale.reported_before else ""
+        print(
+            _status(
+                "stale",
+                f"{stale.filename} — in the inbox {stale.age_hours}h and not filed{again}; "
+                "file it or remove it",
+            )
+        )
 
     if report.dirty is not None and report.failure is None:
         # The pass had nothing to file, so the dirt cost it nothing — but it will refuse the
@@ -315,7 +325,9 @@ def ingest_command(config: Config, vault: VaultConfig, args: argparse.Namespace)
     if handled is not None:
         return handled
 
-    report = run_ingest(config, vault, log_path=args.log_path)
+    report = run_ingest(
+        config, vault, log_path=args.log_path, stale_state=StatePaths.for_vault(vault.name).stale
+    )
     _print_ingest(report)
     if not report.refused:
         # This pass is the safety net for whatever the debounced one was owed (R7): it just did
@@ -323,10 +335,18 @@ def ingest_command(config: Config, vault: VaultConfig, args: argparse.Namespace)
         # answers nothing, and clearing the marker there would silently cancel the retry.
         clear_queue(StatePaths.for_vault(vault.name))
     if report.status is IngestStatus.PARTIAL:
-        print(
-            "some items stayed in the inbox — read the .needs-review marker beside each",
-            file=sys.stderr,
-        )
+        if report.held or report.note_failures:
+            print(
+                "some items stayed in the inbox — read the .needs-review marker beside each",
+                file=sys.stderr,
+            )
+        if report.newly_stale:
+            print(
+                f"{len(report.newly_stale)} inbox file(s) older than "
+                f"{int(STALE_AFTER.total_seconds() // 3600)}h were not filed — "
+                "see the STALE lines above",
+                file=sys.stderr,
+            )
     return report.exit_code
 
 

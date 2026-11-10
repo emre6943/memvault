@@ -15,9 +15,10 @@ visible in one commit's diff (R7).
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -35,11 +36,13 @@ from memvault.ingest import (
     EXIT_OK,
     EXIT_PARTIAL,
     MARKER_SUFFIX,
+    STALE_AFTER,
     DrainedItem,
     HeldItem,
     IngestReport,
     IngestStatus,
     NoteFailure,
+    StaleItem,
     build_commit_message,
     content_id_of,
     filed_ids,
@@ -1637,3 +1640,171 @@ class TestUnroutedIsPerDropNotPerSegment:
         )
 
         assert report.unrouted == ("many.md",), "one drop, named once"
+
+
+# ---------------------------------------------------------------------------------------------
+# A file that outlives the pass must not be reported as OK forever.
+# ---------------------------------------------------------------------------------------------
+
+#: A transcript drop as a session feeder writes it: named and dated for the session's first
+#: turn, written when the session ends, with the project path as its only tag.
+SESSION_DROP = """---
+source: voice
+date: 2026-11-05
+tags: ["/srv/projects/example"]
+---
+A voice session in project /srv/projects/example, session 227a4819.
+
+## user — 14:29
+
+When is the course assignment due?
+
+## assistant — 14:29
+
+Monday 23:59, a group submission.
+"""
+
+NOW = datetime(2026, 11, 10, 23, 0).astimezone()
+
+
+def age(path: Path, hours: float) -> Path:
+    """Backdate a file's modification time to `hours` before `NOW`."""
+    stamp = (NOW - timedelta(hours=hours)).timestamp()
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+class TestStaleInbox:
+    """An inbox file left unfiled past `STALE_AFTER` makes the pass non-OK."""
+
+    def test_a_drop_with_a_path_tag_files_and_drains(self, scratch: Scratch) -> None:
+        """A tag holding an absolute path is ordinary metadata, not a reason to skip a drop."""
+        name = "2026-11-05-voice-5a335fe4.md"
+        drop(scratch.personal, name, SESSION_DROP)
+
+        report = ingest(scratch, now=NOW)
+
+        assert [item.path.name for item in report.filed]
+        assert inbox_files(scratch.personal) == []
+        assert report.stale == ()
+        assert report.status is IngestStatus.OK
+
+    def test_a_drop_named_for_an_old_date_but_written_today_is_not_stale(
+        self, scratch: Scratch
+    ) -> None:
+        """Age comes from the file, not the date in its name or its frontmatter."""
+        path = drop(scratch.personal, "2026-11-05-voice-5a335fe4.md", SESSION_DROP)
+        age(path, 2)
+        classifier = StubClassifier({path.name: NeedsReview("unsure")})
+
+        report = ingest(scratch, classifier=classifier, now=NOW)
+
+        assert report.stale == ()
+
+    def test_a_skipped_file_older_than_the_limit_is_reported(self, scratch: Scratch) -> None:
+        """The silent case: discovery skips it, so the pass files nothing and holds nothing."""
+        age(drop(scratch.personal, "whiteboard.jpg", "not really a jpeg"), 49)
+
+        report = ingest(scratch, now=NOW)
+
+        assert report.filed == () and report.held == ()
+        assert report.stale == (StaleItem("whiteboard.jpg", 49),)
+        assert report.status is IngestStatus.PARTIAL
+        assert report.exit_code == EXIT_PARTIAL
+        assert "1 stale in the inbox" in report.summary_line()
+
+    def test_a_file_younger_than_the_limit_is_not_reported(self, scratch: Scratch) -> None:
+        hours = STALE_AFTER.total_seconds() / 3600 - 1
+        age(drop(scratch.personal, "whiteboard.jpg", "not really a jpeg"), hours)
+
+        report = ingest(scratch, now=NOW)
+
+        assert report.stale == ()
+        assert report.status is IngestStatus.OK
+
+    def test_an_old_held_drop_is_held_not_stale(self, scratch: Scratch) -> None:
+        path = age(drop(scratch.personal, "murky.md", "???"), 72)
+        classifier = StubClassifier({"murky.md": NeedsReview("nothing legible in it")})
+
+        report = ingest(scratch, classifier=classifier, now=NOW)
+
+        assert [item.filename for item in report.held] == ["murky.md"]
+        assert report.stale == ()
+        assert marker_for(path).exists()
+
+    def test_an_old_drop_that_files_is_not_stale(self, scratch: Scratch) -> None:
+        age(drop(scratch.personal, "coffee.md", PERSONAL_BODY), 200)
+
+        report = ingest(scratch, now=NOW)
+
+        assert len(report.filed) == 1
+        assert report.stale == ()
+        assert report.status is IngestStatus.OK
+
+    def test_markers_and_hidden_files_are_not_drops(self, scratch: Scratch) -> None:
+        age(drop(scratch.personal, ".gitkeep", ""), 1000)
+        age(drop(scratch.personal, f"orphan.md{MARKER_SUFFIX}", "reason\n"), 1000)
+
+        report = ingest(scratch, now=NOW)
+
+        assert report.stale == ()
+
+    def test_a_stale_inbox_notifies(self, scratch: Scratch) -> None:
+        age(drop(scratch.personal, "whiteboard.jpg", "x"), 50)
+        recorder = Recorder()
+
+        ingest(scratch, notifier=recorder, now=NOW)
+
+        assert len(recorder.calls) == 1
+        assert "whiteboard.jpg has sat in the inbox for 50h" in recorder.calls[0][1]
+
+    def test_a_stale_file_fails_one_pass_then_is_listed_without_failing(
+        self, scratch: Scratch, tmp_path: Path
+    ) -> None:
+        state = tmp_path / "state" / "stale-reported"
+        age(drop(scratch.personal, "whiteboard.jpg", "x"), 50)
+        recorder = Recorder()
+
+        first = ingest(scratch, notifier=recorder, now=NOW, stale_state=state)
+        second = ingest(scratch, notifier=recorder, now=NOW + timedelta(days=1), stale_state=state)
+
+        assert first.status is IngestStatus.PARTIAL
+        assert second.stale == (StaleItem("whiteboard.jpg", 74, reported_before=True),)
+        assert second.status is IngestStatus.OK
+        assert "1 stale in the inbox" in second.summary_line()
+        assert len(recorder.calls) == 1
+
+    def test_a_rewritten_stale_file_is_reported_again(
+        self, scratch: Scratch, tmp_path: Path
+    ) -> None:
+        state = tmp_path / "stale-reported"
+        path = age(drop(scratch.personal, "whiteboard.jpg", "x"), 60)
+        ingest(scratch, now=NOW, stale_state=state)
+        age(path, 50)
+
+        report = ingest(scratch, now=NOW, stale_state=state)
+
+        assert report.status is IngestStatus.PARTIAL
+
+    def test_a_resolved_stale_file_is_forgotten(self, scratch: Scratch, tmp_path: Path) -> None:
+        state = tmp_path / "stale-reported"
+        path = age(drop(scratch.personal, "whiteboard.jpg", "x"), 50)
+        ingest(scratch, now=NOW, stale_state=state)
+        path.unlink()
+
+        ingest(scratch, now=NOW, stale_state=state)
+
+        assert state.read_text(encoding="utf-8") == ""
+
+    def test_a_failed_pass_does_not_mark_stale_files_reported(
+        self, scratch: Scratch, tmp_path: Path
+    ) -> None:
+        state = tmp_path / "stale-reported"
+        age(drop(scratch.personal, "whiteboard.jpg", "x"), 50)
+        drop(scratch.personal, "coffee.md", PERSONAL_BODY)
+        dirty_transcript(scratch.personal, "stray.md")
+
+        report = ingest(scratch, now=NOW, stale_state=state)
+
+        assert report.failure is not None
+        assert not state.exists()

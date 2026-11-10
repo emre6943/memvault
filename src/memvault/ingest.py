@@ -65,7 +65,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import date
+from datetime import date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 
@@ -110,6 +110,9 @@ FRONTMATTER_HEAD_CHARS = 4096
 #: default the notification names when nobody said otherwise.
 DEFAULT_LOG_PATH = "~/Library/Logs/memvault/ingest.log"
 
+#: Two nightly passes: one missed pass can be a drop that landed at 23:01; two is a pattern.
+STALE_AFTER = timedelta(hours=48)
+
 EXIT_OK = 0
 EXIT_FAILED = 1
 #: Distinct from 1 so a scheduler can tell "some drops need a human" from "the pass broke", and
@@ -147,6 +150,21 @@ class DrainedItem:
 
 
 @dataclass(frozen=True)
+class StaleItem:
+    """An unheld inbox file still present after the pass, and older than `STALE_AFTER`.
+
+    Age is the file's mtime, never its name or `date`: a feeder may name a drop for a session's
+    first turn but write it when the session ends, which can be days later.
+    """
+
+    filename: str
+    age_hours: int
+    #: An earlier pass on this machine already reported this file at this mtime. It is still
+    #: listed, but no longer makes the pass non-OK, so a nightly scheduler alerts once.
+    reported_before: bool = False
+
+
+@dataclass(frozen=True)
 class NoteFailure:
     """A work-vault note that was not written. The raw filing it came from stands."""
 
@@ -166,6 +184,7 @@ class IngestReport:
     recovered: tuple[DrainedItem, ...] = ()
     note_failures: tuple[NoteFailure, ...] = ()
     skipped_notes: tuple[str, ...] = ()
+    stale: tuple[StaleItem, ...] = ()
     #: Drops that filed raw but chose no area, or whose topic note failed. Reported rather than
     #: warned about: choosing none is the designed answer when nothing fits.
     unrouted: tuple[str, ...] = ()
@@ -188,10 +207,14 @@ class IngestReport:
         return self.dirty is not None and self.status is IngestStatus.FAILED
 
     @property
+    def newly_stale(self) -> tuple[StaleItem, ...]:
+        return tuple(item for item in self.stale if not item.reported_before)
+
+    @property
     def status(self) -> IngestStatus:
         if self.failure is not None:
             return IngestStatus.FAILED
-        if self.held or self.note_failures:
+        if self.held or self.note_failures or self.newly_stale:
             return IngestStatus.PARTIAL
         return IngestStatus.OK
 
@@ -214,6 +237,8 @@ class IngestReport:
             parts.append(f"{len(self.recovered)} already filed")
         if self.note_failures:
             parts.append(f"{len(self.note_failures)} note(s) blocked")
+        if self.stale:
+            parts.append(f"{len(self.stale)} stale in the inbox")
         return ", ".join(parts)
 
 
@@ -431,6 +456,8 @@ class _Pass:
     distiller: Distiller
     segmenter: Segmenter
     ingested: date
+    now: datetime
+    stale_state: Path | None = None
 
     filed: list[WrittenFile] = field(default_factory=list)
     notes: list[WrittenFile] = field(default_factory=list)
@@ -441,6 +468,7 @@ class _Pass:
     unrouted: list[str] = field(default_factory=list)
     commits: list[CommitRef] = field(default_factory=list)
     failure: str | None = None
+    stale: list[StaleItem] = field(default_factory=list)
 
     dirty: str | None = None
 
@@ -455,6 +483,52 @@ class _Pass:
         return self.config.work_target(self.vault)
 
     def run(self) -> IngestReport:
+        self._run()
+        # After every exit path, including the empty-inbox one: an inbox whose only files
+        # discovery skips is exactly the inbox that needs this check.
+        self.stale = self._stale()
+        return self.report()
+
+    def _stale(self) -> list[StaleItem]:
+        """Unheld inbox files still here after the pass and older than `STALE_AFTER`.
+
+        A held drop is already reported as held on every pass, so it is not counted twice.
+        """
+        inbox = self.vault.inbox
+        if not inbox.is_dir():
+            return []
+        found: list[tuple[str, StaleItem]] = []
+        for path in sorted(inbox.rglob("*"), key=lambda p: p.relative_to(inbox).as_posix()):
+            relative = path.relative_to(inbox)
+            if not path.is_file() or path.name.endswith(MARKER_SUFFIX):
+                continue
+            if any(part.startswith(".") for part in relative.parts):
+                continue
+            if marker_for(path).exists():
+                continue
+            try:
+                mtime_ns = path.stat().st_mtime_ns
+            except OSError:
+                continue
+            age = self.now - datetime.fromtimestamp(mtime_ns / 1e9, tz=self.now.tzinfo)
+            if age > STALE_AFTER:
+                name = relative.as_posix()
+                hours = int(age.total_seconds() // 3600)
+                logger.warning("%s: in the inbox for %dh and not filed", name, hours)
+                found.append((f"{mtime_ns} {name}", StaleItem(name, hours)))
+
+        # A failed pass's notification names the failure, not these, so they stay unreported.
+        if self.stale_state is None or self.failure is not None:
+            return [item for _, item in found]
+        reported = _read_lines(self.stale_state)
+        try:
+            self.stale_state.parent.mkdir(parents=True, exist_ok=True)
+            self.stale_state.write_text("".join(f"{key}\n" for key, _ in found), encoding="utf-8")
+        except OSError as exc:
+            logger.warning("could not record reported stale files in %s: %s", self.stale_state, exc)
+        return [replace(item, reported_before=key in reported) for key, item in found]
+
+    def _run(self) -> None:
         # The guard runs before the inbox is read, not after. Under idle-triggering the common
         # pass has an empty inbox, and the old order returned "nothing to ingest" without ever
         # asking whether the tree was clean — so a vault that would refuse the moment a drop
@@ -473,12 +547,12 @@ class _Pass:
                 )
             else:
                 logger.info("vault %r: inbox is empty — nothing to ingest", self.vault.name)
-            return self.report()
+            return
 
         if self.dirty is not None:
             logger.error("vault %r: refusing to ingest — %s", self.vault.name, self.dirty)
             self.failure = self.dirty
-            return self.report()
+            return
 
         self._seen = filed_ids(self.vault)
         # Once per pass, not per drop: deriving the project areas stats the memory tree, and a
@@ -494,7 +568,6 @@ class _Pass:
                 self._hold(record, f"ingesting it raised {type(exc).__name__}: {exc}")
 
         self._commit()
-        return self.report()
 
     def report(self) -> IngestReport:
         return IngestReport(
@@ -505,6 +578,7 @@ class _Pass:
             recovered=tuple(self.recovered),
             note_failures=tuple(self.note_failures),
             skipped_notes=tuple(self.skipped_notes),
+            stale=tuple(self.stale),
             # Deduplicated, order preserved: a segmented drop reaches `_ingest_segment` once per
             # segment, and a reader counting "no area chosen: 3" should learn that three drops
             # found no home, not that one drop was split three ways.
@@ -845,10 +919,15 @@ def run_ingest(
     distiller: Distiller | None = None,
     segmenter: Segmenter | None = None,
     ingested: date | None = None,
+    now: datetime | None = None,
+    stale_state: Path | None = None,
     notifier: Notifier | None = notify_failure,
     log_path: str = DEFAULT_LOG_PATH,
 ) -> IngestReport:
     """Run one ingestion pass and report what it did.
+
+    `stale_state` remembers which stale inbox files were already reported; without it every
+    stale file makes the pass non-OK on every run.
 
     The classifier and the distiller are injected rather than constructed unconditionally, so a
     test never spawns a subprocess and a caller can swap the model tier. Both defaults are
@@ -872,6 +951,8 @@ def run_ingest(
         distiller=distiller,
         segmenter=segmenter,
         ingested=ingested or date.today(),
+        now=now or datetime.now().astimezone(),
+        stale_state=stale_state,
     ).run()
 
     logger.info("vault %r: %s", vault.name, report.summary_line())
@@ -882,13 +963,28 @@ def run_ingest(
     return report
 
 
+def _read_lines(path: Path) -> set[str]:
+    try:
+        return set(path.read_text(encoding="utf-8").splitlines())
+    except FileNotFoundError:
+        return set()
+    except OSError as exc:
+        logger.warning("could not read %s, reporting every stale file: %s", path, exc)
+        return set()
+
+
 def _failure_message(report: IngestReport) -> str:
     """One line for the notification: what went wrong, not the whole ledger."""
     if report.failure is not None:
         return report.failure
-    reasons: Sequence[str] = [item.reason for item in report.held] + [
-        item.reason for item in report.note_failures
-    ]
+    reasons: Sequence[str] = (
+        [item.reason for item in report.held]
+        + [item.reason for item in report.note_failures]
+        + [
+            f"{item.filename} has sat in the inbox for {item.age_hours}h without being filed"
+            for item in report.newly_stale
+        ]
+    )
     count = len(reasons)
     lead = f"{count} item(s) need review"
     return f"{lead}: {reasons[0]}" if count == 1 else lead
